@@ -131,12 +131,27 @@ takes effect within one round without a restart: `POLL_INTERVAL_MS`,
 
 ## Docker
 
+### Published images
+
+Release builds are automatically published to GHCR:
+
+```bash
+docker pull ghcr.io/soroban-tooling/soroban-keeper-network/keeper-bot-v2:latest
+docker run ghcr.io/soroban-tooling/soroban-keeper-network/keeper-bot-v2:latest
+```
+
+Version-specific images are also available (e.g. `keeper-bot-v2:v0.2.0`).
+
+### Building locally
+
 The image builds from the repository root, because the bot depends on the
 local SDK in `packages/sdk-ts`:
 
 ```bash
 docker build -f examples/keeper-bot-v2/Dockerfile -t keeper-bot-v2:latest .
 ```
+
+### Deployment with Docker Compose
 
 [`docker-compose.yml`](docker-compose.yml) runs the bot with PostgreSQL:
 

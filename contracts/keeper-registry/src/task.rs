@@ -2,7 +2,14 @@
 //! refund paths (owner cancel and permissionless expiry).
 //!
 //! `register_task`'s arity (owner, task_type, calldata, reward, deadline,
-//! ttl_ledgers, lock_ledgers, verifier) is inherent to the ABI: every field is
+//! ttl_ledgers, lock_ledgers, verifier, condition) is inherent to the ABI:
+//! every field is a distinct scalar a caller must supply, and a params struct
+//! would just move them without improving anything. The allow below is
+//! module-level, not on the function itself, because `#[contractimpl]`
+//! generates its spec entry and client method as sibling items in this module,
+//! not nested inside the `impl` block, so a function- or impl-level attribute
+//! does not cover them.
+//! ttl_ledgers, lock_ledgers, verifier, condition) is inherent to the ABI: every field is
 //! a distinct scalar a caller must supply, and a params struct would just move
 //! them without improving anything. The allow below is module-level, not on
 //! the function itself, because `#[contractimpl]` generates its spec entry
@@ -19,6 +26,7 @@ use crate::internal::*;
 use crate::reputation::{record_missed_claim, record_success, require_reputation_floor};
 use crate::types::{DataKey, Task, TaskStatus, TaskType};
 use crate::verifier::KeeperVerifierClient;
+use crate::TaskConditionClient;
 use crate::{KeeperRegistry, KeeperRegistryArgs, KeeperRegistryClient};
 
 #[contractimpl]
@@ -46,6 +54,15 @@ impl KeeperRegistry {
     //                  this function's own behavior — only `execute_task`
     //                  consumes it. Any address is accepted (verifiers are
     //                  permissionless).
+    //   condition    — optional on-chain conditional executor. `None` behaves
+    //                  exactly as before this parameter existed; `Some(addr)` is
+    //                  stored on the task but does not change this function's own
+    //                  behavior — only `execute_task` consumes it. Any address is
+    //                  accepted (conditions are permissionless).
+    //   condition    — optional pre-claim predicate implementing
+    //                  `ITaskCondition::is_met(task_id)`. `None` preserves the
+    //                  original path; false or failed evaluation leaves the
+    //                  task Pending and returns `ConditionNotMet`.
     //
     // Returns the new task_id.
 
@@ -59,6 +76,7 @@ impl KeeperRegistry {
         ttl_ledgers: u32,
         lock_ledgers: u32,
         verifier: Option<Address>,
+        condition: Option<Address>,
     ) -> Result<u64, KeeperError> {
         require_not_paused(&e)?;
         owner.require_auth();
@@ -71,6 +89,7 @@ impl KeeperRegistry {
             calldata.len(),
             ttl_ledgers,
             lock_ledgers,
+            &condition,
         )?;
 
         bump_instance(&e);
@@ -92,9 +111,11 @@ impl KeeperRegistry {
             claim_ledger: None,
             lock_ledgers,
             verifier,
+            condition,
+            condition: condition.clone(),
         };
         save_task(&e, task_id, &task);
-        emit_task_registered(&e, task_id, &owner, reward, deadline);
+        emit_task_registered(&e, task_id, &owner, reward, deadline, condition);
 
         Ok(task_id)
     }
@@ -200,7 +221,6 @@ impl KeeperRegistry {
         Ok(())
     }
     // ── claim_task ───────────────────────────────────────────────────────────
-
     //
     // Permissionless first-come-first-served claiming. A Pending task may be
     // claimed by anyone; a Claimed task may be re-claimed only after its
@@ -212,6 +232,57 @@ impl KeeperRegistry {
     // `ReputationBelowFloor`. The check runs after the task-state checks, so
     // that error always means "claimable, but not by you", and before any
     // write, so a rejected claim records nothing against the previous claimer.
+    //
+    // ── Condition Resource Cost (docs/TASK_CONDITIONS_DESIGN.md §3) ────────
+    //
+    // When a task carries an optional condition (E10), claim_task calls it to
+    // check whether the underlying off-chain trigger is satisfied. The calling
+    // keeper bears the FULL resource cost of the condition sub-call:
+    //
+    // 1. **Cost Bearer:** The claiming keeper's transaction pays for all CPU,
+    //    memory, and storage operations incurred by the condition contract.
+    //    If the condition is expensive or intentionally resource-intensive,
+    //    the keeper may discover after submission that the claim cost far
+    //    exceeds expectation, turning a seemingly profitable task into a net
+    //    loss.
+    //
+    // 2. **Resource Budget Caps:** Soroban does NOT expose any mechanism to
+    //    cap sub-call resource consumption from the caller's side. Unlike
+    //    Ethereum's EVM (which supports gas stipends like `call{gas: g}()`),
+    //    Soroban shares a monolithic transaction budget across all sub-calls.
+    //    If a condition exhausts the transaction's budget, the entire tx fails.
+    //
+    // 3. **Pre-Claim Simulation (Keeper-Bot Strategy):**
+    //    A keeper bot MUST simulate the condition via `simulateTransaction`
+    //    BEFORE submitting claim_task. Recommended workflow:
+    //
+    //    a. Fetch the task via get_task; if task.condition is None, proceed.
+    //    b. If task.condition is Some(addr):
+    //       - Simulate ITaskCondition::is_ready(task_id) against addr.
+    //       - Record the simulated CPU/memory cost and boolean outcome.
+    //    c. If is_ready returns false, do not claim; condition not met yet.
+    //    d. If is_ready returns true:
+    //       - Calculate: claim_cost = base_claim_tx_cost + condition_sim_cost.
+    //       - Only claim if: task.reward >= claim_cost + off_chain_cost + margin.
+    //    e. If simulated is_ready panics or times out, treat as high-risk
+    //       and skip or apply stricter validation thresholds.
+    //
+    // 4. **Panic Isolation:**
+    //    If the condition panics (a sign the contract is broken or malicious),
+    //    claim_task catches the panic via try_invoke_contract, returns
+    //    ConditionCheckFailed, and leaves the task Pending and retryable.
+    //    The transaction does NOT abort; the keeper is free to retry later
+    //    or wait for the deadline and call expire_task to recover escrow.
+    //
+    // 5. **Keeper-Bot Task-Selection Requirements (Epic E15):**
+    //    Any keeper-bot task-selection logic must:
+    //    - Inspect task.condition on every TaskRegistered event discovery.
+    //    - Build or reference a local allowlist/catalog of known-safe
+    //      conditions with benchmarked costs.
+    //    - Reject unknown or expensive conditions unless explicitly
+    //      allowlisted or the reward is sufficiently large (e.g., 3x cost).
+    //    - Simulate the condition pre-claim to confirm it returns true
+    //      and costs less than a threshold before attempting to claim.
 
     pub fn claim_task(e: Env, keeper: Address, task_id: u64) -> Result<(), KeeperError> {
         require_not_paused(&e)?;
@@ -244,6 +315,17 @@ impl KeeperRegistry {
             _ => return Err(KeeperError::InvalidTaskStatus),
         };
         require_reputation_floor(&e, &keeper)?;
+
+        if let Some(condition) = task.condition.clone() {
+            let is_met = matches!(
+                TaskConditionClient::new(&e, &condition).try_is_met(&task_id),
+                Ok(Ok(true))
+            );
+            if !is_met {
+                emit_condition_not_met(&e, task_id, &condition);
+                return Err(KeeperError::ConditionNotMet);
+            }
+        }
 
         bump_instance(&e);
         if let Some(missed) = missed_claimer {
@@ -278,8 +360,28 @@ impl KeeperRegistry {
     // size is bounded by `MAX_PROOF_LEN` since event data is charged against
     // the paying keeper's transaction resource budget.
     //
+    // ── Distinction: Conditions vs Verifiers ─────────────────────────────
+    //
+    // **Conditions (E10, claim-time gate):** Optional check evaluating whether
+    // the task's underlying reason (e.g., price > threshold) is true, gating
+    // whether a keeper can even claim. Called in claim_task. Expensive
+    // conditions can grief claiming attempts (cost borne by every attempted
+    // claimer). Documented in docs/TASK_CONDITIONS_DESIGN.md §3.
+    //
+    // **Verifiers (E04, execution-time gate):** Optional check validating that
+    // a keeper's submitted proof is valid, gating reward crediting. Called in
+    // execute_task. Expensive verifiers cost only the claiming keeper who
+    // actually executes (one verified attempt per claimed task). Documented in
+    // docs/VERIFIER_DESIGN.md §3.
+    //
+    // Both are optional, independent, and orthogonal. A task can have:
+    // - Neither: today's MVP behavior (no condition, no verifier).
+    // - Condition only: keeper must pass condition to claim; proof trusted.
+    // - Verifier only: keeper claims freely; proof must pass verifier.
+    // - Both: keeper must pass condition to claim AND verifier to get paid.
+    //
     // Verifier resource cost note: When an `IKeeperVerifier` is attached to
-    // a task (Phase 2), the calling keeper pays for the full gas/resource cost
+    // a task (E04), the calling keeper pays for the full gas/resource cost
     // of the verifier sub-call. Soroban does not support caller-side sub-call
     // budget caps; keepers should simulate the verifier (`verify`) pre-claim
     // to estimate resource cost before committing to a claim (see
